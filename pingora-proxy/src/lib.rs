@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time;
 
 use pingora_cache::NoCacheReason;
-use pingora_core::apps::HttpServerApp;
+use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
@@ -95,6 +95,7 @@ pub struct HttpProxy<SV> {
     inner: SV, // TODO: name it better than inner
     client_upstream: Connector,
     shutdown: Notify,
+    pub server_options: Option<HttpServerOptions>,
     pub downstream_modules: HttpModules,
 }
 
@@ -104,8 +105,17 @@ impl<SV> HttpProxy<SV> {
             inner,
             client_upstream: Connector::new(Some(ConnectorOptions::from_server_conf(&conf))),
             shutdown: Notify::new(),
+            server_options: None,
             downstream_modules: HttpModules::new(),
         }
+    }
+
+    fn handle_init_modules(&mut self)
+    where
+        SV: ProxyHttp,
+    {
+        self.inner
+            .init_downstream_modules(&mut self.downstream_modules);
     }
 
     async fn handle_new_request(
@@ -725,6 +735,10 @@ where
         // TODO: impl shutting down flag so that we don't need to read stack.is_shutting_down()
     }
 
+    fn server_options(&self) -> Option<&HttpServerOptions> {
+        self.server_options.as_ref()
+    }
+
     // TODO implement h2_options
 }
 
@@ -733,7 +747,10 @@ use pingora_core::services::listening::Service;
 /// Create a [Service] from the user implemented [ProxyHttp].
 ///
 /// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>> {
+pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV>>
+where
+    SV: ProxyHttp,
+{
     http_proxy_service_with_name(conf, inner, "Pingora HTTP Proxy Service")
 }
 
@@ -744,11 +761,11 @@ pub fn http_proxy_service_with_name<SV>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
-) -> Service<HttpProxy<SV>> {
+) -> Service<HttpProxy<SV>>
+where
+    SV: ProxyHttp,
+{
     let mut proxy = HttpProxy::new(inner, conf.clone());
-    // Add disabled downstream compression module by default
-    proxy
-        .downstream_modules
-        .add_module(ResponseCompressionBuilder::enable(0));
+    proxy.handle_init_modules();
     Service::new(name.to_string(), proxy)
 }

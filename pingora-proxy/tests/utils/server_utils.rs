@@ -26,6 +26,7 @@ use pingora_cache::{
     set_compression_dict_path, CacheMeta, CacheMetaDefaults, CachePhase, MemCache, NoCacheReason,
     RespCacheable,
 };
+use pingora_core::apps::{HttpServerApp, HttpServerOptions};
 use pingora_core::modules::http::compression::ResponseCompression;
 use pingora_core::protocols::{l4::socket::SocketAddr, Digest};
 use pingora_core::server::configuration::Opt;
@@ -38,6 +39,7 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 pub struct ExampleProxyHttps {}
 
@@ -229,6 +231,17 @@ impl ProxyHttp for ExampleProxyHttp {
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let req = session.req_header();
+
+        let write_timeout = req
+            .headers
+            .get("x-write-timeout")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
+        let min_rate = req
+            .headers
+            .get("x-min-rate")
+            .and_then(|v| v.to_str().ok().and_then(|v| v.parse().ok()));
+
         let downstream_compression = req.headers.get("x-downstream-compression").is_some();
         if !downstream_compression {
             // enable upstream compression for all requests by default
@@ -239,6 +252,13 @@ impl ProxyHttp for ExampleProxyHttp {
                 .get_mut::<ResponseCompression>()
                 .unwrap()
                 .adjust_level(0);
+        }
+
+        if let Some(min_rate) = min_rate {
+            session.set_min_send_rate(min_rate);
+        }
+        if let Some(write_timeout) = write_timeout {
+            session.set_write_timeout(Duration::from_secs(write_timeout));
         }
 
         Ok(false)
@@ -264,17 +284,24 @@ impl ProxyHttp for ExampleProxyHttp {
                 "/tmp/nginx-test.sock",
                 false,
                 "".to_string(),
-            )));
+            )?));
         }
         let port = req
             .headers
             .get("x-port")
             .map_or("8000", |v| v.to_str().unwrap());
-        let peer = Box::new(HttpPeer::new(
+
+        let mut peer = Box::new(HttpPeer::new(
             format!("127.0.0.1:{port}"),
             false,
             "".to_string(),
         ));
+
+        if session.get_header_bytes("x-h2") == b"true" {
+            // default is 1, 1
+            peer.options.set_http_version(2, 2);
+        }
+
         Ok(peer)
     }
 
@@ -502,6 +529,15 @@ fn test_main() {
     proxy_service_http.add_tcp("0.0.0.0:6147");
     proxy_service_http.add_uds("/tmp/pingora_proxy.sock", None);
 
+    let mut proxy_service_h2c =
+        pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttp {});
+
+    let http_logic = proxy_service_h2c.app_logic_mut().unwrap();
+    let mut http_server_options = HttpServerOptions::default();
+    http_server_options.h2c = true;
+    http_logic.server_options = Some(http_server_options);
+    proxy_service_h2c.add_tcp("0.0.0.0:6146");
+
     let mut proxy_service_https =
         pingora_proxy::http_proxy_service(&my_server.configuration, ExampleProxyHttps {});
     proxy_service_https.add_tcp("0.0.0.0:6149");
@@ -517,6 +553,7 @@ fn test_main() {
     proxy_service_cache.add_tcp("0.0.0.0:6148");
 
     let services: Vec<Box<dyn Service>> = vec![
+        Box::new(proxy_service_h2c),
         Box::new(proxy_service_http),
         Box::new(proxy_service_https),
         Box::new(proxy_service_cache),

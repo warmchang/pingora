@@ -19,10 +19,14 @@
 use super::HttpTask;
 
 use bytes::Bytes;
+use http::header::ACCEPT_RANGES;
 use log::warn;
 use pingora_error::{ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use std::time::Duration;
+
+use strum::EnumCount;
+use strum_macros::EnumCount as EnumCountMacro;
 
 mod brotli;
 mod gzip;
@@ -49,7 +53,7 @@ pub trait Encode {
 /// The caller should call the corresponding filters for the request header, response header and
 /// response body. If the algorithms are supported, the output response body will be encoded.
 /// The response header will be adjusted accordingly as well. If the algorithm is not supported
-/// or no encoding needed, the response is untouched.
+/// or no encoding is needed, the response is untouched.
 ///
 /// If configured and if the request's `accept-encoding` header contains the algorithm supported and the
 /// incoming response doesn't have that encoding, the filter will compress the response.
@@ -63,23 +67,23 @@ pub struct ResponseCompressionCtx(CtxInner);
 
 enum CtxInner {
     HeaderPhase {
-        compression_level: u32,
         decompress_enable: bool,
         // Store the preferred list to compare with content-encoding
         accept_encoding: Vec<Algorithm>,
+        encoding_levels: [u32; Algorithm::COUNT],
     },
     BodyPhase(Option<Box<dyn Encode + Send + Sync>>),
 }
 
 impl ResponseCompressionCtx {
     /// Create a new [`ResponseCompressionCtx`] with the expected compression level. `0` will disable
-    /// the compression.
+    /// the compression. The compression level is applied across all algorithms.
     /// The `decompress_enable` flag will tell the ctx to decompress if needed.
     pub fn new(compression_level: u32, decompress_enable: bool) -> Self {
         Self(CtxInner::HeaderPhase {
-            compression_level,
             decompress_enable,
             accept_encoding: Vec::new(),
+            encoding_levels: [compression_level; Algorithm::COUNT],
         })
     }
 
@@ -88,10 +92,10 @@ impl ResponseCompressionCtx {
     pub fn is_enabled(&self) -> bool {
         match &self.0 {
             CtxInner::HeaderPhase {
-                compression_level,
                 decompress_enable,
                 accept_encoding: _,
-            } => *compression_level != 0 || *decompress_enable,
+                encoding_levels: levels,
+            } => levels.iter().any(|l| *l != 0) || *decompress_enable,
             CtxInner::BodyPhase(c) => c.is_some(),
         }
     }
@@ -101,25 +105,41 @@ impl ResponseCompressionCtx {
     pub fn get_info(&self) -> Option<(&'static str, usize, usize, Duration)> {
         match &self.0 {
             CtxInner::HeaderPhase {
-                compression_level: _,
                 decompress_enable: _,
                 accept_encoding: _,
+                encoding_levels: _,
             } => None,
             CtxInner::BodyPhase(c) => c.as_ref().map(|c| c.stat()),
         }
     }
 
-    /// Adjust the compression level.
+    /// Adjust the compression level for all compression algorithms.
     /// # Panic
     /// This function will panic if it has already started encoding the response body.
     pub fn adjust_level(&mut self, new_level: u32) {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                compression_level,
                 decompress_enable: _,
                 accept_encoding: _,
+                encoding_levels: levels,
             } => {
-                *compression_level = new_level;
+                *levels = [new_level; Algorithm::COUNT];
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
+    /// Adjust the compression level for a specific algorithm.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn adjust_algorithm_level(&mut self, algorithm: Algorithm, new_level: u32) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase {
+                decompress_enable: _,
+                accept_encoding: _,
+                encoding_levels: levels,
+            } => {
+                levels[algorithm.index()] = new_level;
             }
             CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
         }
@@ -131,9 +151,9 @@ impl ResponseCompressionCtx {
     pub fn adjust_decompression(&mut self, enabled: bool) {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                compression_level: _,
                 decompress_enable,
                 accept_encoding: _,
+                encoding_levels: _,
             } => {
                 *decompress_enable = enabled;
             }
@@ -148,9 +168,9 @@ impl ResponseCompressionCtx {
         }
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                compression_level: _,
                 decompress_enable: _,
                 accept_encoding,
+                encoding_levels: _,
             } => parse_accept_encoding(
                 req.headers.get(http::header::ACCEPT_ENCODING),
                 accept_encoding,
@@ -166,9 +186,9 @@ impl ResponseCompressionCtx {
         }
         match &self.0 {
             CtxInner::HeaderPhase {
-                compression_level,
                 decompress_enable,
                 accept_encoding,
+                encoding_levels: levels,
             } => {
                 if resp.status.is_informational() {
                     if resp.status == http::status::StatusCode::SWITCHING_PROTOCOLS {
@@ -187,7 +207,7 @@ impl ResponseCompressionCtx {
                 let action = decide_action(resp, accept_encoding);
                 let encoder = match action {
                     Action::Noop => None,
-                    Action::Compress(algorithm) => algorithm.compressor(*compression_level),
+                    Action::Compress(algorithm) => algorithm.compressor(levels[algorithm.index()]),
                     Action::Decompress(algorithm) => algorithm.decompressor(*decompress_enable),
                 };
                 if encoder.is_some() {
@@ -205,9 +225,9 @@ impl ResponseCompressionCtx {
     pub fn response_body_filter(&mut self, data: Option<&Bytes>, end: bool) -> Option<Bytes> {
         match &mut self.0 {
             CtxInner::HeaderPhase {
-                compression_level: _,
                 decompress_enable: _,
                 accept_encoding: _,
+                encoding_levels: _,
             } => panic!("Wrong phase: HeaderPhase"),
             CtxInner::BodyPhase(compressor) => {
                 let result = compressor
@@ -257,8 +277,8 @@ impl ResponseCompressionCtx {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Algorithm {
+#[derive(Debug, PartialEq, Eq, Clone, Copy, EnumCountMacro)]
+pub enum Algorithm {
     Any, // the "*"
     Gzip,
     Brotli,
@@ -301,6 +321,10 @@ impl Algorithm {
                 _ => None, // not implemented
             }
         }
+    }
+
+    pub fn index(&self) -> usize {
+        *self as usize
     }
 }
 
@@ -553,6 +577,8 @@ fn adjust_response_header(resp: &mut ResponseHeader, action: &Action) {
     fn set_stream_headers(resp: &mut ResponseHeader) {
         // because the transcoding is streamed, content length is not known ahead
         resp.remove_header(&CONTENT_LENGTH);
+        // remove Accept-Ranges header because range requests will no longer work
+        resp.remove_header(&ACCEPT_RANGES);
         // we stream body now TODO: chunked is for h1 only
         resp.insert_header(&TRANSFER_ENCODING, HeaderValue::from_static("chunked"))
             .unwrap();
@@ -607,12 +633,14 @@ fn test_adjust_response_header() {
     // compress
     let mut header = ResponseHeader::build(200, None).unwrap();
     header.insert_header("content-length", "20").unwrap();
+    header.insert_header("accept-ranges", "bytes").unwrap();
     adjust_response_header(&mut header, &Compress(Gzip));
     assert_eq!(
         header.headers.get("content-encoding").unwrap().as_bytes(),
         b"gzip"
     );
     assert!(header.headers.get("content-length").is_none());
+    assert!(header.headers.get("accept-ranges").is_none());
     assert_eq!(
         header.headers.get("transfer-encoding").unwrap().as_bytes(),
         b"chunked"
